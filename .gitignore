@@ -1,0 +1,15 @@
+# 결과물 / 대용량 데이터 → Google Drive로 공유 (git 제외)
+output/
+captures/
+*.parquet
+*.jsonl
+
+# 실행 로그 / 캐시 / 에디터
+build_log.txt
+build_err.txt
+*.log
+__pycache__/
+.autocomplete.jsonl
+
+# 안 쓰는 옛 코드
+previous(dont_care)/

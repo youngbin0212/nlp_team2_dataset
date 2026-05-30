@@ -1,91 +1,55 @@
+"""LoL 하이라이트 이미지 데이터셋 빌더 (이미지 전용).
+
+- heatmap 있는 영상(has_heatmap.jsonl): most-replayed 상위 지점 → output/has_heatmap/
+- heatmap 없는 영상(no_heatmap.jsonl): 균등분할(앞 10초 skip) → output/no_heatmap/
+- 두 방식 모두 미니맵 매칭(minimap_filter)으로 '게임화면'만 골라 영상당 5장 확보.
+- CSV는 각 폴더에 highlights.csv 로 따로 생성.
+- 자막(해설)은 이 스크립트에서 다루지 않음 (별도 throttle 패스로 video_id 기준 수집 예정).
+
+실행:
+    $env:PATH = "C:\\Users\\kimyb\\.deno\\bin;$env:PATH"   # yt-dlp용 JS 런타임
+    python build_dataset.py
+"""
 import yt_dlp
 import subprocess
 import os
 import csv
-import json
-import urllib.request
 
-# 공통 추출 옵션: deno + ejs:github(원격 솔버)로 정상 추출, 요청 간 텀으로 차단 방지
-# 프레임 캡처는 음성이 필요 없으므로 음성 없는 최고화질 영상 스트림을 우선 선택
+# 추출 옵션: deno + ejs:github(원격 솔버)로 정상 추출, 요청 간 텀으로 차단 방지.
+# 주의: bestvideo(영상전용 DASH)는 ffmpeg 단일프레임 캡처 시 360p로 떨어진다.
+#       progressive(best)가 1920x1080으로 정상 캡처됨.
 YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
-    'format': 'bestvideo[ext=mp4]/bestvideo/best',
+    'format': 'best[ext=mp4]/best',
     'remote_components': ['ejs:github'],
     'sleep_interval_requests': 2,
 }
 
-def format_time(seconds):
-    """초 단위를 HH:MM:SS 형식 문자열로 변환"""
-    s = int(seconds)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f'{h:02d}:{m:02d}:{s:02d}'
-
-# CSV 컬럼 정의 (한 줄 = 이미지 1개 = VLM 입력 1개)
 FIELDNAMES = [
     'video_id',         # 유튜브 영상 ID  ← 자막 파트와 join 하는 키
     'video_title',      # 영상 제목
     'video_url',        # 영상 URL
     'duration_sec',     # 영상 전체 길이(초)
-    'rank',             # 해당 영상 내 추출 순위 (1~top_n)
-    'source',           # 추출 방식: heatmap(most-replayed) / uniform(균등분할)
-    'score',            # 재생 강도(value). uniform이면 빈 값
-    'game_prob',        # CLIP 게임화면 확률(0~1). 필터 통과 점수
+    'rank',             # 영상 내 추출 순위 (1~top_n)
+    'source',           # 추출 방식: heatmap / uniform
+    'score',            # heatmap value(재생강도). uniform이면 빈 값
+    'minimap_score',    # 미니맵 매칭 점수(0~1). 게임화면 필터 통과 점수
     'start_time_sec',   # 추출 지점 시작(초)
     'end_time_sec',     # 추출 지점 끝(초)
     'timestamp',        # 시작 시각 (HH:MM:SS)
     'timestamp_end',    # 끝 시각 (HH:MM:SS)
-    'window_start_sec', # 해설을 긁어온 맥락 윈도우 시작(초)
-    'window_end_sec',   # 해설을 긁어온 맥락 윈도우 끝(초)
-    'transcript_text',  # 그 윈도우에 겹치는 해설(자막) 텍스트  ← VLM 맥락 입력
-    'transcript_lang',  # 자막 언어/출처 (예: ko, ko(auto), none)
     'image_file',       # 캡처 이미지 파일명
 ]
 
-def parse_json3(raw_bytes):
-    """유튜브 json3 자막을 [{start, end, text}, ...] 리스트로 파싱"""
-    data = json.loads(raw_bytes)
-    out = []
-    for ev in data.get('events', []):
-        if 'segs' not in ev:
-            continue
-        text = ''.join(seg.get('utf8', '') for seg in ev['segs']).strip()
-        if not text:
-            continue
-        start = ev.get('tStartMs', 0) / 1000.0
-        dur = ev.get('dDurationMs', 0) / 1000.0
-        out.append({'start': start, 'end': start + dur, 'text': text})
-    return out
-
-def fetch_transcript(info, langs=('ko',)):
-    """수동 자막 우선, 없으면 자동생성 자막을 가져온다.
-    반환: (transcript 리스트, 언어태그 문자열)"""
-    sources = [('subtitles', ''), ('automatic_captions', '(auto)')]
-    for key, suffix in sources:
-        subs = info.get(key) or {}
-        for lang in langs:
-            if lang not in subs:
-                continue
-            url = next((f['url'] for f in subs[lang] if f.get('ext') == 'json3'), None)
-            if not url:
-                continue
-            try:
-                raw = urllib.request.urlopen(url, timeout=30).read()
-                return parse_json3(raw), f'{lang}{suffix}'
-            except Exception as e:
-                print(f'  [자막 경고] {lang}{suffix} 가져오기 실패: {e}')
-    return [], 'none'
-
-def text_in_window(transcript, w_start, w_end):
-    """[w_start, w_end] 구간과 겹치는 자막 텍스트를 한 줄로 합쳐 반환"""
-    parts = [c['text'] for c in transcript
-             if c['end'] >= w_start and c['start'] <= w_end]
-    return ' '.join(parts)
+def format_time(seconds):
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f'{h:02d}:{m:02d}:{s:02d}'
 
 def select_heatmap(info, n, min_gap):
-    """most-replayed heatmap에서 value 상위 + min_gap 간격으로 최대 n개 후보 반환.
-    heatmap이 없으면 None."""
+    """most-replayed에서 value 상위 + min_gap 간격으로 최대 n개 후보. 없으면 None."""
     heatmap = info.get('heatmap')
     if not heatmap:
         return None
@@ -103,8 +67,7 @@ def select_heatmap(info, n, min_gap):
 _SLOT_FRACS = [0.5, 0.35, 0.65, 0.2, 0.8]
 
 def uniform_slots(info, top_n, intro_skip=10):
-    """앞 intro_skip초 건너뛰고 전 구간을 top_n등분.
-    각 구간(슬롯)마다 시도할 후보 지점 리스트를 반환 → 구간당 1장 채택용."""
+    """앞 intro_skip초 건너뛰고 전 구간을 top_n등분. 구간(슬롯)마다 시도 후보 리스트 반환."""
     duration = info.get('duration') or 0
     start_bound = intro_skip if duration > intro_skip else 0
     span = max(0, duration - start_bound)
@@ -112,22 +75,19 @@ def uniform_slots(info, top_n, intro_skip=10):
     for i in range(top_n):
         a = start_bound + span * i / top_n
         b = start_bound + span * (i + 1) / top_n
-        cands = [{'start': a + (b - a) * fr, 'end': a + (b - a) * fr, 'score': None}
-                 for fr in _SLOT_FRACS]
-        slots.append(cands)
+        slots.append([{'start': a + (b - a) * fr, 'end': a + (b - a) * fr, 'score': None}
+                      for fr in _SLOT_FRACS])
     return slots
 
 def _capture(video_url, ts, out_path):
     """ts 지점 1프레임을 out_path(png)로 캡처. 성공 여부 반환."""
-    subprocess.run([
-        'ffmpeg', '-ss', str(ts), '-i', video_url,
-        '-frames:v', '1', out_path, '-y'
-    ], capture_output=True)
+    subprocess.run(['ffmpeg', '-ss', str(ts), '-i', video_url,
+                    '-frames:v', '1', out_path, '-y'], capture_output=True)
     return os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
 def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
-                  context_pad=15, filter_game=True, thresh=0.5):
-    """영상 1개 처리. 게임화면(CLIP)만 골라 최대 top_n장 확보. 행 리스트 반환."""
+                  filter_game=True, thresh=0.45):
+    """영상 1개 처리. 게임화면(미니맵 매칭)만 골라 최대 top_n장 확보. 행 리스트 반환."""
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -143,31 +103,20 @@ def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
     else:
         slots = uniform_slots(info, top_n)
 
-    transcript, lang_tag = fetch_transcript(info, langs=('ko',))
-    if transcript:
-        tdir = os.path.join(output_dir, 'transcripts')
-        os.makedirs(tdir, exist_ok=True)
-        with open(os.path.join(tdir, f'{video_id}.json'), 'w', encoding='utf-8') as f:
-            json.dump(transcript, f, ensure_ascii=False, indent=2)
-    else:
-        print(f'  [자막 없음] {video_id} ({lang_tag})')
-
     if filter_game:
-        import clip_filter
+        import minimap_filter
 
     os.makedirs(output_dir, exist_ok=True)
     video_url = info['url']
     tmp = os.path.join(output_dir, f'_tmp_{video_id}.png')
 
     def check(ts):
-        """ts 캡처 후 게임화면 확률 반환. 캡처 실패면 None."""
         if not _capture(video_url, ts, tmp):
             return None
-        return clip_filter.game_prob(tmp) if filter_game else 1.0
+        return minimap_filter.minimap_score(tmp) if filter_game else 1.0
 
-    chosen = []   # (pick, game_prob, final_path)
+    chosen = []   # (pick, minimap_score, final_path)
     if method == 'heatmap':
-        # value 높은 순으로 게임화면인 것만 top_n개 채움
         for c in cands:
             if len(chosen) >= top_n:
                 break
@@ -177,7 +126,6 @@ def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
                 os.replace(tmp, final)
                 chosen.append((c, gp, final))
     else:
-        # 구간(슬롯)마다 게임화면 나올 때까지 시도, 첫 통과분 채택
         for slot in slots:
             for c in slot:
                 gp = check(c['start'])
@@ -191,42 +139,32 @@ def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
 
     rows = []
     for i, (c, gp, final) in enumerate(chosen):
-        rank = i + 1
         start, end = c['start'], c['end']
-        w_start = max(0, start - context_pad)
-        w_end = min(duration, end + context_pad) if duration else end + context_pad
         fname = os.path.basename(final)
-        snippet = text_in_window(transcript, w_start, w_end)
-        print(f'  캡처: [{format_time(start)}] {fname}  game={gp:.2f}  해설 {len(snippet)}자')
+        print(f'  캡처: [{format_time(start)}] {fname}  minimap={gp:.2f}')
         rows.append({
             'video_id': video_id,
             'video_title': title,
             'video_url': url,
             'duration_sec': int(duration),
-            'rank': rank,
+            'rank': i + 1,
             'source': method,
             'score': round(c['score'], 4) if c['score'] is not None else '',
-            'game_prob': round(gp, 3),
+            'minimap_score': round(gp, 3),
             'start_time_sec': int(start),
             'end_time_sec': int(end),
             'timestamp': format_time(start),
             'timestamp_end': format_time(end),
-            'window_start_sec': int(w_start),
-            'window_end_sec': int(w_end),
-            'transcript_text': snippet,
-            'transcript_lang': lang_tag,
             'image_file': fname,
         })
     if len(chosen) < top_n:
         print(f'  [주의] {video_id}: 게임화면 {len(chosen)}/{top_n}장만 확보')
     return rows
 
-def load_urls(list_file):
-    """입력 파일에서 URL 목록을 읽는다.
-    - .jsonl: 한 줄 = JSON 객체, 'url'(없으면 video_id로 구성) 사용
-    - 그 외(.txt): 한 줄 = URL (빈 줄 / # 주석 무시)
-    """
-    urls = []
+def load_items(list_file):
+    """jsonl(한 줄=JSON, video_id/url) 또는 txt(한 줄=URL)에서 {video_id, url} 목록."""
+    import json
+    items = []
     with open(list_file, encoding='utf-8') as f:
         for ln in f:
             ln = ln.strip()
@@ -234,44 +172,70 @@ def load_urls(list_file):
                 continue
             if list_file.endswith('.jsonl'):
                 obj = json.loads(ln)
-                urls.append(obj.get('url') or f'https://www.youtube.com/watch?v={obj["video_id"]}')
+                vid = obj.get('video_id')
+                url = obj.get('url') or f'https://www.youtube.com/watch?v={vid}'
             else:
-                urls.append(ln)
-    return urls
+                url = ln
+                vid = ln.rsplit('=', 1)[-1].rsplit('/', 1)[-1]
+            items.append({'video_id': vid, 'url': url})
+    return items
 
-def build_dataset(list_file, output_dir, method='heatmap',
-                  top_n=5, min_gap=60, context_pad=15, limit=None,
-                  filter_game=True, thresh=0.5):
+def _done_video_ids(csv_path):
+    """기존 CSV에 기록된 video_id 집합 (이어하기용)."""
+    done = set()
+    if os.path.exists(csv_path):
+        with open(csv_path, encoding='utf-8-sig', newline='') as f:
+            for row in csv.DictReader(f):
+                if row.get('video_id'):
+                    done.add(row['video_id'])
+    return done
+
+def build_dataset(list_file, output_dir, method='heatmap', top_n=5, min_gap=60,
+                  limit=None, filter_game=True, thresh=0.45, resume=True):
     os.makedirs(output_dir, exist_ok=True)
-    urls = load_urls(list_file)
+    items = load_items(list_file)
     if limit:
-        urls = urls[:limit]
-
-    print(f'[{method}] {list_file} → {output_dir} : {len(urls)}개 처리 시작'
-          f' (게임화면 필터={"ON" if filter_game else "OFF"})\n')
-
-    all_rows = []
-    for idx, url in enumerate(urls, 1):
-        print(f'[{idx}/{len(urls)}] {url}')
-        try:
-            rows = process_video(url, output_dir, method=method,
-                                  top_n=top_n, min_gap=min_gap, context_pad=context_pad,
-                                  filter_game=filter_game, thresh=thresh)
-            all_rows.extend(rows)
-        except Exception as e:
-            print(f'  [오류] 처리 실패: {e}')
-        print()
+        items = items[:limit]
 
     csv_path = os.path.join(output_dir, 'highlights.csv')
-    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(all_rows)
+    done = _done_video_ids(csv_path) if resume else set()
 
-    print(f'완료: 영상 {len(urls)}개, 이미지 {len(all_rows)}개')
-    print(f'CSV: {csv_path}')
+    # CSV에 누적 저장(append) — 중간에 끊겨도 진행분 보존. 새 파일이면 헤더 작성.
+    new_file = not os.path.exists(csv_path)
+    f = open(csv_path, 'a', newline='', encoding='utf-8-sig')
+    writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+    if new_file:
+        writer.writeheader()
+        f.flush()
+
+    print(f'[{method}] {list_file} → {output_dir} : 총 {len(items)}개'
+          f' (완료 {len(done)}개 건너뜀)\n')
+
+    processed = skipped = n_img = 0
+    try:
+        for idx, it in enumerate(items, 1):
+            if it['video_id'] in done:
+                skipped += 1
+                continue
+            print(f'[{idx}/{len(items)}] {it["url"]}')
+            try:
+                rows = process_video(it['url'], output_dir, method=method,
+                                     top_n=top_n, min_gap=min_gap,
+                                     filter_game=filter_game, thresh=thresh)
+                for r in rows:
+                    writer.writerow(r)
+                f.flush()
+                done.add(it['video_id'])
+                processed += 1
+                n_img += len(rows)
+            except Exception as e:
+                print(f'  [오류] 처리 실패: {e}')
+            print()
+    finally:
+        f.close()
+
+    print(f'완료: 신규 영상 {processed}개(건너뜀 {skipped}), 이미지 {n_img}개 → {csv_path}')
 
 if __name__ == '__main__':
-    # 연습 실행: 각 방식 소수만
-    build_dataset('has_heatmap.jsonl', 'output', method='heatmap', limit=3)
-    build_dataset('no_heatmap.jsonl', 'output_noheatmap', method='uniform', limit=3)
+    build_dataset('has_heatmap.jsonl', 'output/has_heatmap', method='heatmap')
+    build_dataset('no_heatmap.jsonl', 'output/no_heatmap', method='uniform')
