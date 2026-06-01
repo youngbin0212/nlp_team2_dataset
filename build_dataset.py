@@ -1,23 +1,23 @@
 """LoL 하이라이트 이미지 데이터셋 빌더 (이미지 전용).
 
-- heatmap 있는 영상(has_heatmap.jsonl): most-replayed 상위 지점 → output/has_heatmap/
+- heatmap 있는 영상(has_heatmap.jsonl): most-replayed 상위 → output/has_heatmap/
 - heatmap 없는 영상(no_heatmap.jsonl): 균등분할(앞 10초 skip) → output/no_heatmap/
-- 두 방식 모두 미니맵 매칭(minimap_filter)으로 '게임화면'만 골라 영상당 5장 확보.
-- CSV는 각 폴더에 highlights.csv 로 따로 생성.
-- 자막(해설)은 이 스크립트에서 다루지 않음 (별도 throttle 패스로 video_id 기준 수집 예정).
+- 두 방식 모두 미니맵 매칭(minimap_filter)으로 '게임화면'만 영상당 5장.
+- CSV는 각 폴더에 highlights.csv (video_id 기준 resume/이어하기).
+- 자막은 별도(fetch_transcripts.py).
 
 실행:
-    $env:PATH = "C:\\Users\\kimyb\\.deno\\bin;$env:PATH"   # yt-dlp용 JS 런타임
-    python build_dataset.py
+    $env:PATH = "C:\\Users\\kimyb\\.deno\\bin;$env:PATH"
+    python build_dataset.py            # 1회 실행
+    python run_until_done.py           # 봇차단 자동 대응 반복 실행
 """
 import yt_dlp
 import subprocess
 import os
 import csv
+import time
 
-# 추출 옵션: deno + ejs:github(원격 솔버)로 정상 추출, 요청 간 텀으로 차단 방지.
-# 주의: bestvideo(영상전용 DASH)는 ffmpeg 단일프레임 캡처 시 360p로 떨어진다.
-#       progressive(best)가 1920x1080으로 정상 캡처됨.
+# 추출 옵션: deno + ejs:github(원격 솔버), progressive best(1920x1080 캡처).
 YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
@@ -25,28 +25,30 @@ YDL_OPTS = {
     'remote_components': ['ejs:github'],
     'sleep_interval_requests': 2,
 }
+# 봇 차단 우회: cookies.txt 또는 *cookies*.txt 중 '가장 최근' 파일 자동 사용.
+import glob as _glob
+_ck = [c for c in set(_glob.glob('cookies.txt') + _glob.glob('*cookies*.txt'))
+       if os.path.exists(c)]
+if _ck:
+    YDL_OPTS['cookiefile'] = max(_ck, key=os.path.getmtime)
 
 FIELDNAMES = [
-    'video_id',         # 유튜브 영상 ID  ← 자막 파트와 join 하는 키
-    'video_title',      # 영상 제목
-    'video_url',        # 영상 URL
-    'duration_sec',     # 영상 전체 길이(초)
-    'rank',             # 영상 내 추출 순위 (1~top_n)
-    'source',           # 추출 방식: heatmap / uniform
-    'score',            # heatmap value(재생강도). uniform이면 빈 값
-    'minimap_score',    # 미니맵 매칭 점수(0~1). 게임화면 필터 통과 점수
-    'start_time_sec',   # 추출 지점 시작(초)
-    'end_time_sec',     # 추출 지점 끝(초)
-    'timestamp',        # 시작 시각 (HH:MM:SS)
-    'timestamp_end',    # 끝 시각 (HH:MM:SS)
-    'image_file',       # 캡처 이미지 파일명
+    'video_id', 'video_title', 'video_url', 'duration_sec', 'rank', 'source',
+    'score', 'minimap_score', 'start_time_sec', 'end_time_sec',
+    'timestamp', 'timestamp_end', 'image_file',
 ]
+
+BOT_STOP = 8   # 연속 봇차단 이만큼이면 라운드 중단(쿨다운 필요)
 
 def format_time(seconds):
     s = int(seconds)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     return f'{h:02d}:{m:02d}:{s:02d}'
+
+def _is_botblock(msg):
+    m = (msg or '').lower()
+    return 'not a bot' in m or 'sign in to confirm' in m
 
 def select_heatmap(info, n, min_gap):
     """most-replayed에서 value 상위 + min_gap 간격으로 최대 n개 후보. 없으면 None."""
@@ -63,11 +65,10 @@ def select_heatmap(info, n, min_gap):
             break
     return picks
 
-# 균등분할 슬롯 내 시도 순서(구간 내 위치 비율): 중앙 우선, 실패 시 좌우로
 _SLOT_FRACS = [0.5, 0.35, 0.65, 0.2, 0.8]
 
 def uniform_slots(info, top_n, intro_skip=10):
-    """앞 intro_skip초 건너뛰고 전 구간을 top_n등분. 구간(슬롯)마다 시도 후보 리스트 반환."""
+    """앞 intro_skip초 건너뛰고 전 구간 top_n등분. 구간마다 시도 후보 리스트."""
     duration = info.get('duration') or 0
     start_bound = intro_skip if duration > intro_skip else 0
     span = max(0, duration - start_bound)
@@ -79,15 +80,22 @@ def uniform_slots(info, top_n, intro_skip=10):
                       for fr in _SLOT_FRACS])
     return slots
 
-def _capture(video_url, ts, out_path):
-    """ts 지점 1프레임을 out_path(png)로 캡처. 성공 여부 반환."""
-    subprocess.run(['ffmpeg', '-ss', str(ts), '-i', video_url,
-                    '-frames:v', '1', out_path, '-y'], capture_output=True)
-    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+def _capture(video_url, ts, out_path, tries=3):
+    """ts 1프레임을 png로 캡처. 빈 프레임이면 재시도. -reconnect로 끊김 복구."""
+    for _ in range(tries):
+        subprocess.run([
+            'ffmpeg', '-reconnect', '1', '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5', '-ss', str(ts), '-i', video_url,
+            '-frames:v', '1', out_path, '-y'
+        ], capture_output=True)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return True
+        time.sleep(2)
+    return False
 
 def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
-                  filter_game=True, thresh=0.45):
-    """영상 1개 처리. 게임화면(미니맵 매칭)만 골라 최대 top_n장 확보. 행 리스트 반환."""
+                  filter_game=True, thresh=0.50):
+    """영상 1개 처리. 게임화면(미니맵)만 골라 최대 top_n장. 행 리스트 반환."""
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -115,7 +123,7 @@ def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
             return None
         return minimap_filter.minimap_score(tmp) if filter_game else 1.0
 
-    chosen = []   # (pick, minimap_score, final_path)
+    chosen = []
     if method == 'heatmap':
         for c in cands:
             if len(chosen) >= top_n:
@@ -143,18 +151,12 @@ def process_video(url, output_dir, method='heatmap', top_n=5, min_gap=60,
         fname = os.path.basename(final)
         print(f'  캡처: [{format_time(start)}] {fname}  minimap={gp:.2f}')
         rows.append({
-            'video_id': video_id,
-            'video_title': title,
-            'video_url': url,
-            'duration_sec': int(duration),
-            'rank': i + 1,
-            'source': method,
+            'video_id': video_id, 'video_title': title, 'video_url': url,
+            'duration_sec': int(duration), 'rank': i + 1, 'source': method,
             'score': round(c['score'], 4) if c['score'] is not None else '',
             'minimap_score': round(gp, 3),
-            'start_time_sec': int(start),
-            'end_time_sec': int(end),
-            'timestamp': format_time(start),
-            'timestamp_end': format_time(end),
+            'start_time_sec': int(start), 'end_time_sec': int(end),
+            'timestamp': format_time(start), 'timestamp_end': format_time(end),
             'image_file': fname,
         })
     if len(chosen) < top_n:
@@ -174,10 +176,9 @@ def load_items(list_file):
                 obj = json.loads(ln)
                 vid = obj.get('video_id')
                 url = obj.get('url') or f'https://www.youtube.com/watch?v={vid}'
+                items.append({'video_id': vid, 'url': url})
             else:
-                url = ln
-                vid = ln.rsplit('=', 1)[-1].rsplit('/', 1)[-1]
-            items.append({'video_id': vid, 'url': url})
+                items.append({'video_id': ln.rsplit('=', 1)[-1], 'url': ln})
     return items
 
 def _done_video_ids(csv_path):
@@ -191,7 +192,9 @@ def _done_video_ids(csv_path):
     return done
 
 def build_dataset(list_file, output_dir, method='heatmap', top_n=5, min_gap=60,
-                  limit=None, filter_game=True, thresh=0.45, resume=True):
+                  limit=None, filter_game=True, thresh=0.50, resume=True):
+    """1회 실행. 봇 차단이 연속 BOT_STOP회면 중단하고 blocked=True 반환.
+    반환: {processed, images, remaining, blocked}"""
     os.makedirs(output_dir, exist_ok=True)
     items = load_items(list_file)
     if limit:
@@ -200,7 +203,6 @@ def build_dataset(list_file, output_dir, method='heatmap', top_n=5, min_gap=60,
     csv_path = os.path.join(output_dir, 'highlights.csv')
     done = _done_video_ids(csv_path) if resume else set()
 
-    # CSV에 누적 저장(append) — 중간에 끊겨도 진행분 보존. 새 파일이면 헤더 작성.
     new_file = not os.path.exists(csv_path)
     f = open(csv_path, 'a', newline='', encoding='utf-8-sig')
     writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
@@ -208,33 +210,44 @@ def build_dataset(list_file, output_dir, method='heatmap', top_n=5, min_gap=60,
         writer.writeheader()
         f.flush()
 
-    print(f'[{method}] {list_file} → {output_dir} : 총 {len(items)}개'
-          f' (완료 {len(done)}개 건너뜀)\n')
+    todo = sum(1 for it in items if it['video_id'] not in done)
+    print(f'[{method}] {list_file} → {output_dir} : 총 {len(items)} (완료 {len(done)}, 남음 {todo})')
 
-    processed = skipped = n_img = 0
-    try:
-        for idx, it in enumerate(items, 1):
-            if it['video_id'] in done:
-                skipped += 1
-                continue
-            print(f'[{idx}/{len(items)}] {it["url"]}')
-            try:
-                rows = process_video(it['url'], output_dir, method=method,
-                                     top_n=top_n, min_gap=min_gap,
-                                     filter_game=filter_game, thresh=thresh)
-                for r in rows:
-                    writer.writerow(r)
-                f.flush()
-                done.add(it['video_id'])
-                processed += 1
-                n_img += len(rows)
-            except Exception as e:
+    processed = n_img = consec_bot = 0
+    blocked = False
+    for idx, it in enumerate(items, 1):
+        if it['video_id'] in done:
+            continue
+        print(f'[{idx}/{len(items)}] {it["url"]}')
+        try:
+            rows = process_video(it['url'], output_dir, method=method,
+                                 top_n=top_n, min_gap=min_gap,
+                                 filter_game=filter_game, thresh=thresh)
+            for r in rows:
+                writer.writerow(r)
+            f.flush()
+            done.add(it['video_id'])
+            processed += 1
+            n_img += len(rows)
+            consec_bot = 0
+        except Exception as e:
+            if _is_botblock(str(e)):
+                consec_bot += 1
+                print(f'  [봇차단] {consec_bot}회 연속')
+                if consec_bot >= BOT_STOP:
+                    print('봇 차단 지속 → 이번 라운드 중단 (쿨다운 필요)')
+                    blocked = True
+                    break
+            else:
                 print(f'  [오류] 처리 실패: {e}')
-            print()
-    finally:
-        f.close()
+        print()
 
-    print(f'완료: 신규 영상 {processed}개(건너뜀 {skipped}), 이미지 {n_img}개 → {csv_path}')
+    f.close()
+    remaining = sum(1 for it in items if it['video_id'] not in done)
+    print(f'라운드 종료: 신규 {processed}, 이미지 {n_img}, 남음 {remaining}'
+          + (' [봇차단 중단]' if blocked else ''))
+    return {'processed': processed, 'images': n_img,
+            'remaining': remaining, 'blocked': blocked}
 
 if __name__ == '__main__':
     build_dataset('has_heatmap.jsonl', 'output/has_heatmap', method='heatmap')
