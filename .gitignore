@@ -3,11 +3,13 @@ output/
 captures/
 transcripts/
 *.parquet
-*.jsonl
 *.zip
+*.jsonl
 
 # 로그인 쿠키 (민감정보 — 절대 커밋 금지)
 *cookies*.txt
+# 단, 팀원용 '빈' 쿠키 템플릿만 git 포함 (실제 쿠키 붙여넣지 말 것)
+!www.youtube.com_cookies.txt
 
 # 실행 로그 / 캐시 / 에디터
 build_log.txt

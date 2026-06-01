@@ -1,0 +1,4 @@
+# Netscape HTTP Cookie File
+# 여기 아래에 본인 YouTube 쿠키를 붙여넣고 저장하세요.
+# (크롬 확장 "Get cookies.txt LOCALLY" → youtube.com 로그인 상태에서 Export → 내용 전체 복붙)
+# ⚠️ 로그인 정보이므로 외부 공유 / git push 금지.
