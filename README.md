@@ -40,6 +40,41 @@ output/
 transcripts/     영상별 타임코드 자막 {video_id}.json
 ```
 
+## 다른 PC에서 자막만 받기 (팀원용)
+이미지는 이미 완성됐고, **자막(`fetch_transcripts.py`)** 만 다른 IP에서 받으면 봇 차단을 피하기 쉽다.
+
+**1. 코드 받기**
+```
+git clone <레포주소>
+```
+
+**2. output 폴더 넣기**
+드라이브로 공유받은 `output` 폴더를 clone한 폴더 안에 통째로 넣는다.
+(자막 스크립트가 `output/*_highlights.csv` 의 영상 목록을 읽음)
+
+**3. 준비물 설치** (PowerShell)
+```powershell
+pip install yt-dlp
+irm https://deno.land/install.ps1 | iex     # deno (yt-dlp용 JS 런타임)
+```
+
+**4. 유튜브 쿠키 넣기** (봇 차단 우회용, 본인 계정)
+1. 크롬 웹스토어에서 **"Get cookies.txt LOCALLY"** 확장 설치
+2. 크롬에서 **youtube.com 접속** (구글 **로그인** 상태)
+3. 확장 아이콘 → **Export**
+4. 받은 내용을 폴더 안 **`www.youtube.com_cookies.txt`** 파일에 통째로 붙여넣고 저장
+   - ⚠️ 쿠키는 로그인 정보 → 외부 공유 / git push 금지
+
+**5. 실행**
+```powershell
+$env:PATH = "$HOME\.deno\bin;$env:PATH"
+python fetch_transcripts.py
+```
+- "차단/429"가 떠도 8회 연속이면 알아서 40~80분 쉬었다 재개. 끊겨도 다시 실행하면 이어서 함.
+
+**6. 결과 돌려주기**
+다 되면 **`transcripts/` 폴더** + output 안에 생긴 **`*_highlights_text.csv` 2개**를 공유.
+
 ## 주요 파일
 | 파일 | 설명 |
 |---|---|
